@@ -130,21 +130,24 @@ export class DirectThreadEntity extends Entity {
 
   public async broadcastVideo(options: DirectThreadBroadcastVideoOptions) {
     const uploadId = options.uploadId || Date.now().toString();
-    const videoInfo = PublishService.getVideoInfo(options.video);
+    const video_info = PublishService.getVideoInfo(options.video);
     await this.client.upload.video({
       video: options.video,
       uploadId,
       isDirect: true,
-      ...videoInfo,
+      ...video_info,
     });
 
-    await Bluebird.try(() =>
-      this.client.media.uploadFinish({
-        upload_id: uploadId,
-        source_type: '2',
-        video: { length: videoInfo.duration / 1000.0 },
-      }),
-    ).catch(IgResponseError, PublishService.catchTranscodeError(videoInfo, options.transcodeDelay || 4 * 1000));
+    const finish = {
+      upload_id: uploadId,
+      source_type: '2',
+      video: { length: video_info.duration / 1000.0 },
+    };
+
+    await Bluebird.try(() => this.client.media.uploadFinish(finish)).catch(
+      IgResponseError,
+      PublishService.catchTranscodeError({ client: this.client, finish, video_info }),
+    );
 
     return await this.broadcast({
       item: 'configure_video',
@@ -167,12 +170,15 @@ export class DirectThreadEntity extends Entity {
       mediaType: '11',
     });
 
-    await Bluebird.try(() =>
-      this.client.media.uploadFinish({
-        upload_id: uploadId,
-        source_type: '4',
-      }),
-    ).catch(IgResponseError, PublishService.catchTranscodeError({ duration }, options.transcodeDelay || 4 * 1000));
+    const finish = {
+      upload_id: uploadId,
+      source_type: '4',
+    };
+
+    await Bluebird.try(() => this.client.media.uploadFinish(finish)).catch(
+      IgResponseError,
+      PublishService.catchTranscodeError({ client: this.client, finish }),
+    );
 
     return await this.broadcast({
       item: 'share_voice',

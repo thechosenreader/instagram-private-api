@@ -13,6 +13,8 @@ import {
   PostingStoryPhotoOptions,
   PostingStoryVideoOptions,
   PostingVideoOptions,
+  PublishCatchTranscodeErrorOptions,
+  PublishVideoInfo,
   SEGMENT_DIVIDERS,
   UploadRetryContext,
   UploadSegmentedVideoOptions,
@@ -34,22 +36,44 @@ export class PublishService extends Repository {
   private static publishDebug = debug('ig:publish');
   private chance = new Chance();
 
+  private static _catchTranscodeError(attempts: number, options: PublishCatchTranscodeErrorOptions) {
+    return async error => {
+      if (error.response.statusCode !== 202) {
+        throw new IgUploadVideoError(
+          error.response as IgResponse<UploadRepositoryVideoResponseRootObject>,
+          options.video_info,
+        );
+      }
+
+      const { transcode_delay_ms, max_retries, client, finish } = {
+        transcode_delay_ms: 4 * 1000,
+        max_retries: 0,
+        ...options,
+      };
+
+      if (max_retries !== 0 && attempts > max_retries) return; // TODO: should we do something better here?
+
+      PublishService.publishDebug(
+        `Received transcode error: ${JSON.stringify(
+          error.response.body,
+        )}, on attempt ${attempts} trying again after ${transcode_delay_ms}ms`,
+      );
+
+      await Bluebird.delay(transcode_delay_ms);
+
+      return await Bluebird.try(() => client.media.uploadFinish(finish)).catch(
+        IgResponseError,
+        PublishService._catchTranscodeError(attempts + 1, options),
+      );
+    };
+  }
+
   /**
    * The current way of handling the 202 - Accepted; Transcode pending -error
-   * @param videoInfo The video info for debugging reasons
-   * @param transcodeDelayInMs The delay for instagram to transcode the video
+   *  - keep trying until we receive a success, or max_retries is reached
    */
-  public static catchTranscodeError(videoInfo, transcodeDelayInMs: number) {
-    return error => {
-      if (error.response.statusCode === 202) {
-        PublishService.publishDebug(
-          `Received trancode error: ${JSON.stringify(error.response.body)}, waiting ${transcodeDelayInMs}ms`,
-        );
-        return Bluebird.delay(transcodeDelayInMs);
-      } else {
-        throw new IgUploadVideoError(error.response as IgResponse<UploadRepositoryVideoResponseRootObject>, videoInfo);
-      }
-    };
+  public static catchTranscodeError(options: PublishCatchTranscodeErrorOptions) {
+    return PublishService._catchTranscodeError(0, options);
   }
 
   /**
@@ -57,7 +81,7 @@ export class PublishService extends Repository {
    * @param buffer Buffer, containing the video-file
    * @returns duration in ms, width and height in px
    */
-  public static getVideoInfo(buffer: Buffer): { duration: number; width: number; height: number } {
+  public static getVideoInfo(buffer: Buffer): PublishVideoInfo {
     const width = PublishService.read16(buffer, ['moov', 'trak', 'stbl', 'avc1'], 24);
     const height = PublishService.read16(buffer, ['moov', 'trak', 'stbl', 'avc1'], 26);
     return {
@@ -153,39 +177,42 @@ export class PublishService extends Repository {
 
   public async video(options: PostingVideoOptions) {
     const uploadId = Date.now().toString();
-    const videoInfo = PublishService.getVideoInfo(options.video);
-    PublishService.publishDebug(`Publishing video to timeline: ${JSON.stringify(videoInfo)}`);
+    const video_info = PublishService.getVideoInfo(options.video);
+    PublishService.publishDebug(`Publishing video to timeline: ${JSON.stringify(video_info)}`);
     await Bluebird.try(() =>
       this.regularVideo({
         video: options.video,
         uploadId,
-        ...videoInfo,
+        ...video_info,
       }),
     ).catch(IgResponseError, error => {
-      throw new IgUploadVideoError(error.response as IgResponse<UploadRepositoryVideoResponseRootObject>, videoInfo);
+      throw new IgUploadVideoError(error.response as IgResponse<UploadRepositoryVideoResponseRootObject>, video_info);
     });
     await this.client.upload.photo({
       file: options.coverImage,
       uploadId: uploadId.toString(),
     });
 
-    await Bluebird.try(() =>
-      this.client.media.uploadFinish({
-        upload_id: uploadId,
-        source_type: '4',
-        video: { length: videoInfo.duration / 1000.0 },
-      }),
-    ).catch(IgResponseError, PublishService.catchTranscodeError(videoInfo, options.transcodeDelay || 5000));
+    const finish = {
+      upload_id: uploadId,
+      source_type: '4',
+      video: { length: video_info.duration / 1000.0 },
+    };
+
+    await Bluebird.try(() => finish).catch(
+      IgResponseError,
+      PublishService.catchTranscodeError({ client: this.client, finish, video_info, transcode_delay_ms: 5000 }),
+    );
 
     const configureOptions: MediaConfigureTimelineVideoOptions = {
       upload_id: uploadId.toString(),
       caption: options.caption,
-      length: videoInfo.duration / 1000.0,
-      width: videoInfo.width,
-      height: videoInfo.height,
+      length: video_info.duration / 1000.0,
+      width: video_info.width,
+      height: video_info.height,
       clips: [
         {
-          length: videoInfo.duration / 1000.0,
+          length: video_info.duration / 1000.0,
           source_type: '4',
         },
       ],
@@ -247,13 +274,22 @@ export class PublishService extends Repository {
           uploadId: item.uploadId,
           isSidecar: true,
         });
-        await Bluebird.try(() =>
-          this.client.media.uploadFinish({
-            upload_id: item.uploadId,
-            source_type: '4',
-            video: { length: item.videoInfo.duration / 1000.0 },
+
+        const finish = {
+          upload_id: item.uploadId,
+          source_type: '4',
+          video: { length: item.videoInfo.duration / 1000.0 },
+        };
+
+        await Bluebird.try(() => this.client.media.uploadFinish(finish)).catch(
+          IgResponseError,
+          PublishService.catchTranscodeError({
+            client: this.client,
+            finish,
+            video_info: item.videoInfo,
+            transcode_delay_ms: item.transcodeDelay,
           }),
-        ).catch(IgResponseError, PublishService.catchTranscodeError(item.videoInfo, item.transcodeDelay));
+        );
       }
     }
 
@@ -559,13 +595,23 @@ export class PublishService extends Repository {
       waterfallId,
       uploadId,
     });
-    await Bluebird.try(() =>
-      this.client.media.uploadFinish({
-        upload_id: uploadId,
-        source_type: '3',
-        video: { length: videoInfo.duration / 1000.0 },
+
+    const finish = {
+      upload_id: uploadId,
+      source_type: '3',
+      video: { length: videoInfo.duration / 1000.0 },
+    };
+
+    await Bluebird.try(() => this.client.media.uploadFinish(finish)).catch(
+      IgResponseError,
+      PublishService.catchTranscodeError({
+        client: this.client,
+        finish,
+        video_info: videoInfo,
+        transcode_delay_ms: options.transcodeDelay,
       }),
-    ).catch(IgResponseError, PublishService.catchTranscodeError(videoInfo, options.transcodeDelay));
+    );
+
     return Bluebird.try(() =>
       this.client.media.configureToStoryVideo({
         upload_id: uploadId,
