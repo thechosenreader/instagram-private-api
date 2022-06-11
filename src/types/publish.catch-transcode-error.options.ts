@@ -1,4 +1,4 @@
-import { IgApiClient } from 'tools/doc-entries';
+import { IgApiClient } from '../core/client';
 import { MediaUploadFinishOptions } from './media.uploadfinish.options';
 import { PublishVideoInfo } from './publish.video-info';
 
